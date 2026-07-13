@@ -1,5 +1,5 @@
 import os
-import re
+from re import compile
 from xml.dom import minidom
 from xml.etree import ElementTree
 from xml.etree.ElementTree import Element, SubElement
@@ -13,7 +13,8 @@ from ..qgis.expressions import (
 from .transformations import processTransformation
 from ..version import __version__
 from ..geostyler.custom_properties import WellKnownText
-from.parsecdata import _serialize_xml
+
+REGEX_NONWORDCHARS = compile(r'\W')
 
 _warnings = []
 
@@ -23,7 +24,7 @@ def convert(geostyler, options=None):
     _warnings = []
     attribs = {
         "version": "1.0.0",
-        "xsi:schemaLocation": "http://www.opengis.net/sld StyledLayerDescriptor.xsd",
+        "xsi:schemaLocation": "http://schemas.opengis.net/sld/1.0.0/StyledLayerDescriptor.xsd",
         "xmlns": "http://www.opengis.net/sld",
         "xmlns:ogc": "http://www.opengis.net/ogc",
         "xmlns:xlink": "http://www.w3.org/1999/xlink",
@@ -88,10 +89,10 @@ def _replaceSpecialCharacters(replacement, text=""):
     """
     Replace all characters that are not matching one of [a-zA-Z0-9_].
     """
-    return re.sub('[^\w]', replacement, text)
+    return REGEX_NONWORDCHARS.sub(replacement, text)
 
 
-def _createSymbolizers(symbolizers):
+def _createSymbolizers(symbolizers) -> list:
     sldSymbolizers = []
     for sl in symbolizers:
         symbolizer = _createSymbolizer(sl)
@@ -364,34 +365,28 @@ def _geometryFromSymbolizer(sl):
 
 def _iconSymbolizer(sl):
     path = sl["image"]
-    if path.lower().endswith("svg"):
-        return _svgMarkerSymbolizer(sl)
+    if path.lower().endswith(".svg"):
+        # TODO: investigate if this still applies (SVGs are markers, not icons?)
+        return _markSymbolizer(sl)
     else:
         return _rasterImageMarkerSymbolizer(sl)
 
 
-def _svgMarkerSymbolizer(sl):
-    root, graphic = _basePointSimbolizer(sl)
-    svg = _svgGraphic(sl)
-    graphic.insert(0, svg)
-    return root
-
-
 def _rasterImageMarkerSymbolizer(sl):
-    root, graphic = _basePointSimbolizer(sl)
+    root, graphic = _basePointSymbolizer(sl)
     img = _rasterImageGraphic(sl)
     graphic.insert(0, img)
     return root
 
 
 def _markSymbolizer(sl):
-    root, graphic = _basePointSimbolizer(sl)
+    root, graphic = _basePointSymbolizer(sl)
     mark = _markGraphic(sl)
     graphic.insert(0, mark)
     return root
 
 
-def _basePointSimbolizer(sl):
+def _basePointSymbolizer(sl):
     size = _symbolProperty(sl, "size")
     rotation = _symbolProperty(sl, "rotate")
     opacity = _symbolProperty(sl, "opacity")
@@ -421,6 +416,9 @@ def _markGraphic(sl):
     strokeWidth = _symbolProperty(sl, "strokeWidth")
     outlineDasharray = _symbolProperty(sl, "outlineDasharray")
     shape = _symbolProperty(sl, "wellKnownName")
+    if shape.lower().endswith(".svg") and "://" not in shape:
+        # If the marker is a (local) SVG, use its path as the name (NOTE: this is specific to GeoServer)
+        shape = f"file://{os.path.basename(shape)}"
     mark = Element("Mark")
     _addSubElement(mark, "WellKnownName", shape)
     if fillOpacity:
@@ -434,33 +432,29 @@ def _markGraphic(sl):
         _addCssParameter(stroke, "stroke-opacity", strokeOpacity)
         if outlineDasharray is not None:
             _addCssParameter(stroke, "stroke-dasharray", outlineDasharray)
-
-    return mark
-
-
-def _svgGraphic(sl):
-    path = os.path.basename(sl["image"])
-    color = _symbolProperty(sl, "color")
-    outlineColor = _symbolProperty(sl, "strokeColor")
-    outlineWidth = _symbolProperty(sl, "strokeWidth")
-    mark = Element("Mark")
-    _addSubElement(mark, "WellKnownName", "file://%s" % path)
-    fill = _addSubElement(mark, "Fill")
-    _addCssParameter(fill, "fill", color)
-    stroke = _addSubElement(mark, "Stroke")
-    _addCssParameter(stroke, "stroke", outlineColor)
-    _addCssParameter(stroke, "stroke-width", outlineWidth)
     return mark
 
 
 def _rasterImageGraphic(sl):
-    path = os.path.basename(sl["image"])
+    path = sl.get("image", "")
+    fmt = sl.get("format")
+
+    if not path.startswith(("http://", "https://")):
+        path = os.path.basename(path)
+
     externalGraphic = Element("ExternalGraphic")
-    attrib = {"xlink:type": "simple", "xlink:href": path}
-    SubElement(externalGraphic, "OnlineResource", attrib=attrib)
-    _addSubElement(
-        externalGraphic, "Format", "image/%s" % os.path.splitext(path)[1][1:]
+    SubElement(
+        externalGraphic,
+        "OnlineResource",
+        attrib={"xlink:type": "simple", "xlink:href": path},
     )
+
+    if fmt:
+        _addSubElement(externalGraphic, "Format", fmt)
+    else:
+        ext = os.path.splitext(path)[1][1:] or "png"
+        _addSubElement(externalGraphic, "Format", f"image/{ext}")
+
     return externalGraphic
 
 
@@ -591,6 +585,9 @@ def handleOperator(exp):
 
 def handleFunction(exp):
     name = operatorToFunction.get(exp[0], exp[0])
+    if name == "to_string" and len(exp) == 2:
+        # Special case: SLD/OGC does not know a "cast to string" function
+        return handleLiteral(exp[1])
     elem = Element("ogc:Function", name=name)
     if len(exp) > 1:
         for arg in exp[1:]:

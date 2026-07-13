@@ -59,6 +59,9 @@ def processLayer(layer, options=None):
             and renderer.get("classBreakType") in ["GraduatedColor", "GraduatedSymbol"]
         ):
             rules.extend(processClassBreaksRenderer(renderer, options))
+        
+        elif renderer["type"] == "CIMChartRenderer":
+            rules.extend(processChartRenderer(renderer, options))
         else:
             _warnings.append("Unsupported renderer type: %s" % str(renderer))
             return geostyler
@@ -134,6 +137,117 @@ def processClassBreaksRenderer(renderer, options):
         rules.reverse()
         for index, rule in enumerate(rules):
             rule["symbolizers"] = symbolsAscending[index]
+    return rules
+
+
+def processChartRenderer(renderer, options):
+    rules = []
+
+    # Basic setup for chart renderer
+    to_lower = options.get("tolowercase", False)
+    fields = renderer.get("fieldNames", [])
+    norm_fields = [f.lower() if to_lower else f for f in fields]
+
+    if not norm_fields:
+        _warnings.append(
+            "CIMChartRenderer skipped: fieldNames list is empty; "
+            "chart cannot be generated."
+        )
+        return rules
+
+    symbol_layers = renderer.get("chartSymbol", {}).get("symbol", {}).get("symbolLayers", [])
+    chart_layer = next(
+        (
+            ly for ly in symbol_layers
+            if ly.get("type") in {"CIMPieChartMarker", "CIMBarChartMarker", "CIMStackedBarChartMarker"}
+        ),
+        None
+    )
+    if not chart_layer:
+        _warnings.append(
+            "CIMChartRenderer skipped: unsupported symbol layer "
+            "(only CIMPieChartMarker, CIMBarChartMarker, or CIMStackedBarChartMarker are handled)."
+        )
+        return rules
+
+    # Colors & opacities
+    fill_colors = []
+    opacities = []
+
+    for part in chart_layer.get("parts", []):
+        polygon_symbol = part.get("polygonSymbol", {})
+        fill_layer = next(
+            (
+                sl for sl in polygon_symbol.get("symbolLayers", [])
+                if sl.get("type") == "CIMSolidFill" and sl.get("enable", True)
+            ),
+            None,
+        )
+        color = fill_layer.get("color") if fill_layer else None
+        fill_colors.append(_processColor(color).lstrip("#") if color else "000000")
+        opacities.append(_processOpacity(color) if color else 1.0)
+
+    avg_opacity = sum(opacities) / len(opacities) if opacities else 1.0
+
+    # Build Image-Chart expression
+    total_expr = "(" + " + ".join(norm_fields) + ")"
+    expr_list = [f"${{100 * {fld} / {total_expr}}}" for fld in norm_fields]
+
+    if chart_layer["type"] == "CIMPieChartMarker":
+        chart_type = "p3"
+        chart_data = ",".join(expr_list)
+    elif chart_layer["type"] == "CIMBarChartMarker":
+        chart_type = "bvg"
+        chart_data = "|".join(expr_list)
+    else:  # CIMStackedBarChartMarker
+        chart_type = "bvs"
+        chart_data = "|".join(expr_list)
+
+    # Size clamping (Esri → Image‑Charts)
+    base_size = chart_layer.get("size", 40)
+    if chart_type in {"bvg", "bvs"}:
+        default_size = max(min(base_size + 10, 80), 48)
+    else:  # pie
+        default_size = max(min(base_size, 60), 32)
+
+    # Build image‑charts URL
+    chart_url = (
+        f"http://chart?"
+        f"cht={chart_type}"
+        f"&chd=t:{chart_data}"
+        f"&chco={','.join(fill_colors)}"
+        f"&chf=bg,s,FFFFFF00"
+    )
+
+    if chart_type == "p3":
+        # Rotation only on pie charts (chp) → prefer explicit rotation on the layer; else fall back to visual variable
+        rotation_fallback = _getSymbolRotationFromVisualVariables(renderer, to_lower)
+        rotation_deg = chart_layer.get("rotation", rotation_fallback or 0)
+        chp_deg = (rotation_deg + 180) % 360  # chp is clockwise from 3 o’clock, so add 180 deg
+        chp_rad = round(math.radians(chp_deg), 4)
+        chart_url += f"&chp={chp_rad}"
+    elif chart_type in {"bvg", "bvs"}:  # bar charts need bar‑width param
+        chart_url += "&chbh=a,1,2"
+
+    # Final symbolizer & rule
+    chart_symbolizer = {
+        "kind": "Icon",
+        "image": chart_url,
+        "size": default_size,
+        "opacity": round(avg_opacity, 2),
+        "format": "application/chart",
+    }
+
+    # Include base symbolizers if a baseSymbol is present
+    base_symbolizers = []
+    if "baseSymbol" in renderer:
+        base_symbolizers = processSymbolReference(renderer["baseSymbol"], options)
+
+    rules.append({
+        "name": "Chart",
+        "symbolizers": base_symbolizers + [chart_symbolizer],
+    })
+
     return rules
 
 
@@ -505,6 +619,43 @@ def _esriFontToStandardSymbols(charindex):
         return "circle"
 
 
+def apply_color_substitution(image_data, substitutions):
+    try:
+        from PIL import Image
+        from io import BytesIO
+    except ImportError:
+        # Optional: emit logging warning instead of print
+        print("Warning: Pillow is not installed. Skipping color substitution.")
+        return image_data
+
+    try:
+        original_image = Image.open(BytesIO(image_data))
+        image = original_image.convert("RGBA")
+        pixels = image.load()
+
+        color_map = {}
+        for sub in substitutions:
+            old = _hexToRGB(_processColor(sub["oldColor"]))
+            new = _hexToRGB(_processColor(sub["newColor"]))
+            color_map[old] = new
+
+        width, height = image.size
+        for x in range(width):
+            for y in range(height):
+                r, g, b, a = pixels[x, y]
+                if (r, g, b) in color_map:
+                    nr, ng, nb = color_map[(r, g, b)]
+                    pixels[x, y] = (nr, ng, nb, a)
+
+        output = BytesIO()
+        # Use PNG as Python writes in BGR order, but Java cannot read it
+        image.save(output, format="PNG")
+        return output.getvalue()
+
+    except Exception as e:
+        print(f"Warning: Failed to apply color substitution: {e}")
+        return None
+
 def processSymbolLayer(layer, symboltype, options):
     replaceesri = options.get("replaceesri", False)
     if layer["type"] == "CIMSolidStroke":
@@ -703,25 +854,48 @@ def processSymbolLayer(layer, symboltype, options):
                     "bridgestyle",
                     str(uuid.uuid4()).replace("-", ""),
                 )
+                image = base64.decodebytes(data.encode())
+                colorSubstitutions = layer.get("colorSubstitutions")
+                if colorSubstitutions:
+                    image = apply_color_substitution(image, colorSubstitutions)
+                    ext = "png" # Color substitution requires PNG format
                 iconName = f"{str(uuid.uuid4())}.{ext}"
                 iconFile = os.path.join(path, iconName)
                 os.makedirs(path, exist_ok=True)
                 with open(iconFile, "wb") as f:
-                    f.write(base64.decodebytes(data.encode()))
+                    f.write(image)
                     _usedIcons.append(iconFile)
                 url = iconFile
 
         rotate = layer.get("rotation", 0)
         size = _ptToPxProp(layer, "height", _ptToPxProp(layer, "size", 0))
-        return {
-            "opacity": 1.0,
-            "rotate": 0.0,
-            "kind": "Icon",
-            "color": None,
-            "image": url,
-            "size": size,
-            "Z": 0,
-        }
+        if layer["type"] == "CIMPictureFill":
+            return {
+                "kind": "Fill",
+                "opacity": 1.0,
+                "graphicFill": [
+                    {
+                        "opacity": 1.0,
+                        "rotate": 0.0,
+                        "kind": "Icon",
+                        "color": None,
+                        "image": url,
+                        "size": size,
+                        "Z": 0,
+                    }
+                ],
+                "Z": 0,
+                }
+        else:
+            return {
+                "opacity": 1.0,
+                "rotate": 0.0,
+                "kind": "Icon",
+                "color": None,
+                "image": url,
+                "size": size,
+                "Z": 0,
+            }
     else:
         return None
 
@@ -773,10 +947,11 @@ def _orientedMarkerAtEndOfLine(markerPlacement):
 
 
 def _extractOffset(symbolLayer):
-    # Arcgis looks to apply a strange factor.
+    # Offsets in ArcGIS are in points, but we need them in pixels. Also, they are orientated same as in SLD
+    # (x points to the right, y points up). Finally, Arcgis looks to apply a strange factor.
     offset_x = _ptToPxProp(symbolLayer, "offsetX", 0) * OFFSET_FACTOR
-    offset_y = _ptToPxProp(symbolLayer, "offsetY", 0) * OFFSET_FACTOR * -1
-    if offset_x == 0 and offset_y != 0:
+    offset_y = _ptToPxProp(symbolLayer, "offsetY", 0) * OFFSET_FACTOR
+    if offset_x == 0 and offset_y == 0:
         return None
     return [offset_x, offset_y]
 
@@ -834,7 +1009,11 @@ def _processColor(color):
         return "#%02x%02x%02x" % (int(values[0]), int(values[0]), int(values[0]))
     else:
         return "#000000"
-
+    
+def _hexToRGB(hex_string):
+    """Convert '#rrggbb' to (r, g, b) tuple."""
+    hex_string = hex_string.lstrip("#")
+    return tuple(int(hex_string[i:i+2], 16) for i in (0, 2, 4))    
 
 def _cmyk2Rgb(cmyk_array):
     c = cmyk_array[0]
