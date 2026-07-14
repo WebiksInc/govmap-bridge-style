@@ -4,36 +4,54 @@ from ..geostyler.custom_properties import WellKnownText
 from .constants import PROPERTY_NAME_PATTERN
 
 
-def convertExpression(expression, engine, tolowercase):
+def convertExpression(expression, engine, tolowercase, numericFields=None):
     if engine == "Arcade":
         expression = convertArcadeExpression(expression)
     if tolowercase:
         expression = expression.lower()
     if "+" in expression or "&" in expression:
-        if "+" in expression:
-            tokens = expression.split("+")[::-1]
-        else:
-            tokens = expression.split("&")[::-1]
+        separator = "+" if "+" in expression else "&"
         addends = []
-        for token in tokens:
+        for token in expression.split(separator):
             if "[" in token:
-                addends.append(["PropertyName", processPropertyName(token)])
+                addends.append(propertyExpression(token, numericFields))
             else:
-                literal = token.replace('"', "")
-                addends.append(replaceSpecialLiteral(literal))
-            allOps = addends[0]
-            for attr in addends[1:]:
-                allOps = ["Concatenate", attr, allOps]
+                literal = replaceSpecialLiteral(token.strip().replace('"', ""))
+                if not literal:
+                    continue
+                # Merge consecutive literals (e.g. a newline followed by text) into a
+                # single one: whitespace-only SLD literals are dropped by GeoServer
+                # when an XML rewrite strips the CDATA sections.
+                if addends and isinstance(addends[-1], str):
+                    addends[-1] += literal
+                else:
+                    addends.append(literal)
+        if not addends:
+            return ""
+        allOps = addends[-1]
+        for attr in addends[-2::-1]:
+            allOps = ["Concatenate", attr, allOps]
         expression = allOps
     else:
-        expression = ["PropertyName", processPropertyName(expression)]
+        expression = propertyExpression(expression, numericFields)
     return expression
 
 
 def replaceSpecialLiteral(literal):
-    if literal == "vbnewline":
+    if literal.lower() in ("vbnewline", "vbcrlf", "vblf"):
         return WellKnownText.NEW_LINE
     return literal
+
+
+def propertyExpression(token, numericFields=None):
+    name = processPropertyName(token)
+    expression = ["PropertyName", name]
+    pattern = (numericFields or {}).get(name.lower())
+    if pattern:
+        # Numeric fields are labelled as-is by ArcGIS ("10"), while GeoServer renders
+        # the raw double ("10.0" or "1.1E7"); numberFormat reproduces the ArcGIS look.
+        return ["numberFormat", pattern, expression]
+    return expression
 
 
 def processPropertyName(token):

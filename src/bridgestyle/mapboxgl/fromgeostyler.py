@@ -8,12 +8,13 @@ from ..qgis.expressions import (
     OGC_PROPERTYNAME,
     OGC_IS_EQUAL_TO,
     OGC_IS_NULL,
-    OGC_SUB
+    OGC_IS_NOT_NULL,
+    OGC_SUB,
+    OGC_IS_LIKE
 )
 
 # Globals
 _warnings = []
-_processTextSymbolizer = False
 
 # Constants
 SOURCE_NAME = "vector-source"
@@ -48,6 +49,7 @@ def convertGroup(group, qgis_layers, baseUrl, workspace, name):
     for layername in group["layers"]:
         layer = qgis_layers[layername]
         geostyler, icons, sprites, warnings = qgis2geostyler.convert(layer)
+        allWarnings.extend(warnings)
         allSprites.update(sprites)  # combine/accumulate sprites
         geostylers[layername] = geostyler
         mbox, mbWarnings = convert(geostyler, None)
@@ -71,9 +73,10 @@ def toSpriteSheet(allSprites):
     img, img2x, painter, painter2x, spritesheet, spritesheet2x = qgis2geostyler.initSpriteSheet(width, height)
     x = 0
     for name, _sprites in allSprites.items():
+        name_without_ext = os.path.splitext(name)[0]
         s = _sprites["image"]
         s2x = _sprites["image2x"]
-        qgis2geostyler.drawSpriteSheet(name, painter, painter2x, spritesheet, spritesheet2x, x, s, s2x)
+        qgis2geostyler.drawSpriteSheet(name_without_ext, painter, painter2x, spritesheet, spritesheet2x, x, s, s2x)
         x += s.width()
     painter.end()
     painter2x.end()
@@ -87,6 +90,8 @@ def convert(geostyler, options=None):
     _warnings = []
     layers = processLayer(geostyler)
     layers.sort(key=lambda l: l["Z"])
+    [l.pop('Z', None) for l in layers]
+    layers.sort(key=lambda l: l["type"] == "symbol")
     obj = {
         "version": 8,
         "glyphs": "mapbox://fonts/mapbox/{fontstack}/{range}.pbf",
@@ -146,16 +151,20 @@ def processLayer(layer):
     allLayers = []
 
     ruleNumber = 0
-    for rule in layer.get("rules", []):
-        layers = processRule(rule, layer["name"], ruleNumber)
+    rules = layer.get("rules", [])
+    for rule in rules:
+        layers = processRule(rule, layer["name"], ruleNumber, rules)
         ruleNumber += 1
         allLayers += layers
 
     return allLayers
 
 
-def processRule(rule, source, ruleNumber):
+def processRule(rule, source, ruleNumber, rules):
     filt = convertExpression(rule.get("filter", None))
+    if filt == "ELSE":  # None of the other filters apply
+        filt = _processElseFilter(rule, ruleNumber, rules)
+
     minzoom = None
     maxzoom = None
     if "scaleDenominator" in rule:
@@ -185,6 +194,20 @@ def processRule(rule, source, ruleNumber):
     return layers
 
 
+def _processElseFilter(elseRule, ruleNumber, rules):
+    # Wrap the other rules in a NOT ( ANY (rule1, rule2...)) to construct an explicit ELSE filter
+    otherFilters = ["any"]
+    for idx, rule in enumerate(rules):
+        if idx == ruleNumber:  # This is the ElseFilter
+            continue
+        filt = convertExpression(rule.get("filter", None))
+        if filt:
+            otherFilters.append(filt)
+
+    elseFilter = ["!", otherFilters]
+    return elseFilter
+
+
 func = {
     OGC_PROPERTYNAME: "get",
     "Or": "any",
@@ -195,7 +218,9 @@ func = {
     "PropertyIsGreaterThanOrEqualTo": ">=",
     "PropertyIsLessThan": "<",
     "PropertyIsGreaterThan": ">",
-    OGC_IS_NULL: "has",
+    OGC_IS_LIKE: "in",  # we only support LIKE %substring% filters (full substring matching)
+    OGC_IS_NULL: "!",
+    OGC_IS_NOT_NULL: "has",
     "Add": "+",
     OGC_SUB: "-",
     "Mul": "*",
@@ -216,13 +241,18 @@ func = {
     "atan": "atan",
     "atan2": "atan2",
     "sin": "sin",
+    "exp": "exp",
     "cos": "cos",
     "tan": "tan",
     "log": "ln",
     "strCapitalize": None,
     "min": "min",
-    "max": "max"
-}  # TODO
+    "max": "max",
+    "parseLong": "to-number",
+    "parseDouble": "to-number",
+    "to_string": "to-string",
+    "sqrt": "sqrt",
+}
 
 
 def convertExpression(exp):
@@ -234,16 +264,64 @@ def convertExpression(exp):
             _warnings.append("Unsupported expression function for mapbox conversion: '%s'" % exp[0])
             return None
         else:
-            convertedExp = [funcName]
-            if funcName == "has" and isinstance(exp[1], list):
+            if funcName == "!" and isinstance(exp[1], list):
                 # Special case to add "is null" support
-                convertedExp.append(convertExpression(exp[1][-1]))
+                convertedExp = [func.get("Not", None), ["has", convertExpression(exp[1][-1])]]
+            elif funcName == "has" and isinstance(exp[1], list):
+                # Special case to add "is not null" support
+                convertedExp = [funcName, convertExpression(exp[1][-1])]
+            elif funcName == "exp":
+                # Special case to add "exp" support: replace with e^(x)
+                convertedExp = ["^", ["e"], convertExpression(exp[1])]
+            elif funcName == "atan2":
+                # Special case to replace atan2 with a piecewise function using atan.
+                convertedExp = _convertAtan2(exp)
+            elif funcName == "in":
+                # Special case to add "LIKE %substring%" support
+                convertedExp = convertLikeExpression(exp)
             else:
+                convertedExp = [funcName]
                 for arg in exp[1:]:
                     convertedExp.append(convertExpression(arg))
             return convertedExp
     else:
         return exp
+
+def _convertAtan2(exp):
+    # See https://en.wikipedia.org/wiki/Atan2#Definition%20and%20computation
+    # Note that the order of x and y is reversed in the definition above
+    exp_x = convertExpression(exp[2])
+    exp_y = convertExpression(exp[1])
+
+    convertedExpression = [
+        "case",
+            [">", exp_x, 0],
+                ["atan", ["/", exp_y, exp_x]],
+            ["all", ["<", exp_x, 0], [">=", exp_y, 0]],
+                ["+", ["atan", ["/", exp_y, exp_x]], math.pi],
+            ["all", ["<", exp_x, 0], ["<", exp_y, 0]],
+                ["-", ["atan", ["/", exp_y, exp_x]], math.pi],
+            ["all", ["==", exp_x, 0], [">", exp_y, 0]],
+                (math.pi / 2.0),
+            ["all", ["==", exp_x, 0], ["<", exp_y, 0]],
+                -(math.pi / 2.0),
+            0  # undefined, but we have to return something - we'll return 0
+    ]
+    return convertedExpression
+
+def convertLikeExpression(exp):
+    # Special case to add "LIKE %substring%" support
+    if not isinstance(exp[2], str):
+        _warnings.append(f"LIKE Substring {exp[2]} expected to be a string literal.")
+        return None
+    if not (exp[2].startswith('%') and exp[2].endswith('%')):
+        _warnings.append(f"Only enclosing % wildcards are supported in LIKE Substring {exp[2]}")
+        return None
+    val = exp[2].strip('%')  # remove trailing %
+    if '%' in val or '_' in val:
+        _warnings.append(f"Non-enclosing _ or % wildcards in LIKE Substring {exp[2]} are not supported")
+        return None
+    return ["in", val, convertExpression(exp[1])]
 
 
 def processSymbolizer(sl):
@@ -284,8 +362,6 @@ def _symbolProperty(sl, name, default=None):
 
 
 def _textSymbolizer(sl):
-    if not _processTextSymbolizer:
-        return None
     layout = {}
     paint = {}
     color = _symbolProperty(sl, "color")
@@ -302,7 +378,7 @@ def _textSymbolizer(sl):
         layout["text-offset"] = [offsetx, offsety]
 
     if "haloColor" in sl and "haloSize" in sl:
-        paint["text-halo-width"] = _symbolProperty(sl, "haloSize")
+        paint["text-halo-width"] = float(_symbolProperty(sl, "haloSize"))
         paint["text-halo-color"] = _symbolProperty(sl, "haloColor")
 
     layout["text-field"] = label
@@ -336,9 +412,26 @@ def _lineSymbolizer(sl, graphicStrokeLayer=0):
     offset = _symbolProperty(sl, "offset")
 
     paint = {}
+    layout = {}
+    graphicStrokeLayers = []
     if graphicStroke is not None:
-        _warnings.append("Marker lines not supported for Mapbox GL conversion")
-        # TODO
+        for marker in graphicStroke:
+            markerPaint = {}
+            markerLayout = {}
+            kind = marker.get("kind")
+            if kind == "Mark":
+                markerLayout["symbol-placement"] = "line-center"
+                markerLayout["icon-image"] = marker.get("spriteName")
+                markerLayout["icon-size"] = marker.get("size", 1) / 64
+                markerLayout["icon-rotate"] = marker.get("rotate", 0.0)
+                markerLayout["icon-rotation-alignment"] = "viewport"
+                markerLayout["icon-allow-overlap"] = True
+                markerPaint["icon-color"] = marker.get("color")
+                markerPaint["icon-opacity"] = marker.get("opacity", 1)
+            else:
+                _warnings.append(f"Unsupported graphicStroke marker kind '{kind}'")
+                continue
+            graphicStrokeLayers.append({"type": "symbol", "layout": markerLayout, "paint": markerPaint})
 
     if color is None:
         paint["visibility"] = "none"
@@ -346,12 +439,22 @@ def _lineSymbolizer(sl, graphicStrokeLayer=0):
         paint["line-width"] = width
         paint["line-opacity"] = opacity
         paint["line-color"] = color
+        layout["line-cap"] = cap
+        layout["line-join"] = join
     if isinstance(dasharray, str):
         paint["line-dasharray"] = _parseSpaceArray(dasharray)
     if offset is not None:
         paint["line-offset"] = offset
 
-    return {"type": "line", "paint": paint}
+    lineLayer = {
+        "type": "line",
+        "paint": paint,
+        "layout": layout
+    }
+
+    if graphicStrokeLayers:
+        return [lineLayer] + graphicStrokeLayers
+    return lineLayer
 
 
 def number(string):
@@ -379,67 +482,71 @@ def _iconSymbolizer(sl):
     path = os.path.splitext(os.path.basename(image)[0])
     rotation = _symbolProperty(sl, "rotate")
 
-    paint = {}
-    paint["icon-image"] = path
-    paint["icon-rotate"] = rotation
-    size = _symbolProperty(sl, "size", 16) / 64.0
-    paint["icon-size"] = size
-    return {"type": "symbol", "paint": paint}
+    paint = {
+        "icon-image": path,
+        "icon-size": _symbolProperty(sl, "size", 16) / 64.0,
+        "icon-rotate": rotation
+    }
+    return {
+        "type": "symbol",
+        "paint": paint
+    }
 
 
 def _markSymbolizer(sl):
-    paint = {}
-    paint["icon-image"] = _symbolProperty(sl, "spriteName")
+    shape = sl.get('wellKnownName')
+    if shape is not None and shape != "circle":
+        name = os.path.splitext(shape)[0]
+        rotation = _symbolProperty(sl, "rotate")
+        size = _symbolProperty(sl, "size", 16) / 64.0
 
-    rotation = _symbolProperty(sl, "rotate")
-    paint["icon-rotate"] = rotation
+        paint = {
+            "icon-image": name,
+            "icon-rotate": rotation,
+            "icon-size": size
+        }
+        return {"type": "symbol", "layout": paint}
 
-    size = _symbolProperty(sl, "size", 16) / 64.0
-    paint["icon-size"] = size
-    return {"type": "symbol", "layout": paint}
-    # if shape.startswith("file://"):
-    #     svgFilename = shape.split("//")[-1]
-    #     name = os.path.splitext(svgFilename)[0]
-    #     paint = {}
-    #     paint["icon-image"] = name
-    #     rotation = _symbolProperty(sl, "rotate")
-    #     paint["icon-rotate"] = rotation
-    #
-    #     size = _symbolProperty(sl, "size", 16)/64.0
-    #     paint["icon-size"] = size
-    #
-    #     #paint["icon-rotate"] = rotation
-    #     return {"type": "symbol", "layout": paint}
-    # else:
-    #     size = _symbolProperty(sl, "size")
-    #     opacity = _symbolProperty(sl, "opacity")
-    #     color = _symbolProperty(sl, "color")
-    #     outlineColor = _symbolProperty(sl, "strokeColor")
-    #     outlineWidth = _symbolProperty(sl, "strokeWidth")
-    #
-    #     paint = {}
-    #     paint["circle-radius"] = ["/", size, 2]
-    #     paint["circle-color"] = color
-    #     paint["circle-opacity"] = opacity
-    #     paint["circle-stroke-width"] = outlineWidth
-    #     paint["circle-stroke-color"] = outlineColor
-    #
-    #     return {"type": "circle", "layout": paint}
+    # Shape is a circle (or symbol should be rendered like that)
+    size = _symbolProperty(sl, "size")
+    opacity = _symbolProperty(sl, "opacity")
+    color = _symbolProperty(sl, "color")
+    outlineColor = _symbolProperty(sl, "strokeColor")
+    outlineWidth = _symbolProperty(sl, "strokeWidth")
+    dasharray = _symbolProperty(sl, "dasharray")
+
+    paint = {
+        "circle-radius": ["/", size, 2],
+        "circle-color": color,
+        "circle-opacity": opacity,
+        "circle-stroke-width": outlineWidth,
+        "circle-stroke-color": outlineColor
+    }
+
+    return {
+        "type": "circle",
+        "paint": paint
+    }
 
 
 def _fillSymbolizer(sl):
     paint = {}
     opacity = _symbolProperty(sl, "opacity")
     color = sl.get("color", None)
-    graphicFill = sl.get("graphicFill", None)
-    if graphicFill is not None:
-        _warnings.append("Marker fills not supported for Mapbox GL conversion")
-        # TODO
-        # fill = {"type": "fill", "paint": {
-        #     "fill-color":   _symbolProperty(graphicFill[0], "color"),
-        #     "fill-opacity": opacity
-        # }}
-        fill = None  # don't fill -- this causes issues either way...
+    dasharray = _symbolProperty(sl, "outlineDasharray")
+    join = _symbolProperty(sl, "join")
+    offset = _symbolProperty(sl, "offset")
+    graphicFills = sl.get("graphicFill", None)
+    if graphicFills is not None:
+        fill = []
+        for graphicFill in graphicFills:
+            fill.append({
+                "type": "fill",
+                "paint": {
+                    "fill-opacity": graphicFill.get("fillOpacity", 1.0),
+                    "fill-pattern": graphicFill["spriteName"],
+                }
+            })
     else:
         paint["fill-opacity"] = opacity * _symbolProperty(sl, "fillOpacity", 1)
         if color is not None:
@@ -453,7 +560,14 @@ def _fillSymbolizer(sl):
                     "line-width": _symbolProperty(sl, "outlineWidth") or 1,
                     "line-opacity": (_symbolProperty(sl, "outlineOpacity") or 1) * opacity,
                     "line-color": outlineColor
+                },
+                "layout": {
+                    "line-join": join
                 }}
+        if isinstance(dasharray, str):
+            line['paint']["line-dasharray"] = _parseSpaceArray(dasharray)
+        if offset is not None:
+            line['paint']["line-offset"] = offset
     if line:
         return [fill, line]
     return fill
