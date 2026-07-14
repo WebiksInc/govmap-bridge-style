@@ -7,8 +7,9 @@ try:
         QgsExpressionContextUtils, QgsFields, QgsFeature
     )
 except (ImportError, ModuleNotFoundError):
-    QgsExpressionNodeBinaryOperator = None
-    QgsExpressionNode = None
+    QgsExpressionNode = QgsExpression = QgsExpressionNodeBinaryOperator = None
+    QgsMapLayer = QgsVectorLayer = QgsFeatureRequest = QgsExpressionContext = None
+    QgsExpressionContextUtils = QgsFields = QgsFeature = None
 
 
 class UnsupportedExpressionException(Exception):
@@ -33,26 +34,26 @@ _qbo = None      # BinaryOperator
 _nt = None       # NodeType
 BINOPS_MAP = {}  # Mapping of QGIS binary operators to OGC operators (where possible)
 
-if QgsExpressionNode is None or QgsExpressionNodeBinaryOperator is None:
-    raise CompatibilityException("Your QGIS version is not compatible with bridgestyle")
+# QGIS is optional: without it, this module can still provide the OGC constants
+# used by the other converters, but ExpressionConverter will refuse to work.
+if QgsExpressionNode is not None and QgsExpressionNodeBinaryOperator is not None:
+    # Make sure that we can find the binary operator types
+    if hasattr(QgsExpressionNodeBinaryOperator, "boOr"):
+        _qbo = QgsExpressionNodeBinaryOperator
+    elif hasattr(getattr(QgsExpressionNodeBinaryOperator, "BinaryOperator", object()), "boOr"):
+        _qbo = QgsExpressionNodeBinaryOperator.BinaryOperator
 
-# Make sure that we can find the binary operator types
-if hasattr(QgsExpressionNodeBinaryOperator, "boOr"):
-    _qbo = QgsExpressionNodeBinaryOperator
-elif hasattr(getattr(QgsExpressionNodeBinaryOperator, "BinaryOperator", object()), "boOr"):
-    _qbo = QgsExpressionNodeBinaryOperator.BinaryOperator
+    # Make sure that we can find the node types
+    if hasattr(QgsExpressionNode, "ntBinaryOperator"):
+        _nt = QgsExpressionNode
+    elif hasattr(getattr(QgsExpressionNode, "NodeType", object()), "ntBinaryOperator"):
+        _nt = QgsExpressionNode.NodeType
 
-# Make sure that we can find the node types
-if hasattr(QgsExpressionNode, "ntBinaryOperator"):
-    _nt = QgsExpressionNode
-elif hasattr(getattr(QgsExpressionNode, "NodeType", object()), "ntBinaryOperator"):
-    _nt = QgsExpressionNode.NodeType
-
-if _qbo is None or _nt is None:
-    raise CompatibilityException("Your QGIS version is not compatible with bridgestyle")
+    if _qbo is None or _nt is None:
+        raise CompatibilityException("Your QGIS version is not compatible with bridgestyle")
 
 # Mapping of QGIS binary operators to OGC operators (where possible)
-BINOPS_MAP = {
+BINOPS_MAP = {} if _qbo is None else {
     _qbo.boOr: "Or",
     _qbo.boAnd: "And",
     _qbo.boEQ: OGC_IS_EQUAL_TO,
@@ -150,6 +151,9 @@ class ExpressionConverter:
         If that layer is a vector layer, it will sample the first feature and use it
         for the field list and the expression context. """
 
+        if _qbo is None or _nt is None:
+            raise CompatibilityException("QGIS is not available or not compatible with bridgestyle")
+
         self.layer = layer
 
         feature = self._get_feature(layer)
@@ -194,7 +198,7 @@ class ExpressionConverter:
         """ Cleans up the expression converter instance. """
         self.layer = None
         self.fields = None
-        if isinstance(self.context, QgsExpressionContext):
+        if QgsExpressionContext is not None and isinstance(self.context, QgsExpressionContext):
             self.context.clearCachedValues()
         self.context = None
         self.warnings.clear()
