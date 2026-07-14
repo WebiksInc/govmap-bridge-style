@@ -13,6 +13,7 @@ from ..qgis.expressions import (
 from .transformations import processTransformation
 from ..version import __version__
 from ..geostyler.custom_properties import WellKnownText
+from .parsecdata import _serialize_xml  # noqa: F401 - installs the ElementTree CDATA serializer
 
 REGEX_NONWORDCHARS = compile(r'\W')
 
@@ -261,7 +262,9 @@ def _textSymbolizer(sl):
     if followLine:
         _addVendorOption(root, "followLine", True)
     elif "background" not in sl:
-        _addVendorOption(root, "autoWrap", 50)
+        autoWrap = sl.get("autoWrap", 50)
+        if autoWrap:
+            _addVendorOption(root, "autoWrap", autoWrap)
     group = "yes" if sl.get("group", True) else "no"
     _addVendorOption(root, "group", group)
 
@@ -598,20 +601,12 @@ def handleFunction(exp):
 
 
 def handleLiteral(v):
-    specialLiteralElem = handleSpecialLiteral(v)
-    if (specialLiteralElem is not None):
-        return specialLiteralElem
     elem = Element("ogc:Literal")
-    elem.text = str(v)
+    if isinstance(v, str) and WellKnownText.NEW_LINE in v:
+        elem.append(createCDATA(v.replace(WellKnownText.NEW_LINE, "\n")))
+    else:
+        elem.text = str(v)
     return elem
-
-
-def handleSpecialLiteral(v):
-    if v == WellKnownText.NEW_LINE:
-        elem = Element("ogc:Literal")
-        elem.append(createCDATA("\n"))
-        return elem
-    return None
 
 
 def createCDATA(text=None):

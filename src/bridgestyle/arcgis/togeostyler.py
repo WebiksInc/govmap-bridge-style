@@ -12,6 +12,7 @@ from .constants import (
     )
 from .expressions import convertExpression, convertWhereClause, processRotationExpression
 from .wkt_geometries import to_wkt
+from ..geostyler.custom_properties import WellKnownText
 
 
 _usedIcons = []
@@ -67,9 +68,10 @@ def processLayer(layer, options=None):
             return geostyler
 
         if layer.get("labelVisibility", False):
+            numericFields = _numericFieldFormatPatterns(layer)
             for labelClass in layer.get("labelClasses", []):
                 rules.append(
-                    processLabelClass(labelClass, tolowercase)
+                    processLabelClass(labelClass, tolowercase, numericFields)
                 )
 
         rotation = _getSymbolRotationFromVisualVariables(renderer, tolowercase)
@@ -251,9 +253,32 @@ def processChartRenderer(renderer, options):
     return rules
 
 
-def processLabelClass(labelClass, tolowercase=False):
+def _numericFieldFormatPatterns(layer):
+    """ Returns a dict of lowercased field name -> DecimalFormat pattern for the
+    fields of the given layer that have a numeric format in their description. """
+    patterns = {}
+    for field in layer.get("featureTable", {}).get("fieldDescriptions", []):
+        numberFormat = field.get("numberFormat")
+        if numberFormat and field.get("fieldName"):
+            decimals = 6
+            if numberFormat.get("roundingOption") == "esriRoundNumberOfDecimals":
+                decimals = numberFormat.get("roundingValue", 6)
+            pattern = "#" if decimals == 0 else "#." + "#" * decimals
+            patterns[field["fieldName"].lower()] = pattern
+    return patterns
+
+
+def _containsNewLine(expression):
+    if isinstance(expression, str):
+        return WellKnownText.NEW_LINE in expression
+    if isinstance(expression, list):
+        return any(_containsNewLine(item) for item in expression)
+    return False
+
+
+def processLabelClass(labelClass, tolowercase=False, numericFields=None):
     textSymbol = labelClass["textSymbol"]["symbol"]
-    expression = convertExpression(labelClass["expression"], labelClass["expressionEngine"], tolowercase)
+    expression = convertExpression(labelClass["expression"], labelClass["expressionEngine"], tolowercase, numericFields)
     fontFamily = textSymbol.get("fontFamilyName", "Arial")
     fontSize = _ptToPxProp(textSymbol, "height", 12, True)
     color = _extractFillColor(textSymbol["symbol"]["symbolLayers"])
@@ -272,6 +297,18 @@ def processLabelClass(labelClass, tolowercase=False):
         "size": fontSize,
         "weight": fontWeight,
     }
+
+    if _containsNewLine(expression):
+        # The expression breaks lines explicitly; don't let the renderer re-wrap it
+        symbolizer["autoWrap"] = 0
+    else:
+        stackingProps = labelClass.get("maplexLabelPlacementProperties", {}).get(
+            "labelStackingProperties", {}
+        )
+        maxCharsPerLine = stackingProps.get("maximumNumberOfCharsPerLine")
+        if maxCharsPerLine:
+            # Approximate the ArcGIS chars-per-line stacking limit in pixels
+            symbolizer["autoWrap"] = round(maxCharsPerLine * fontSize * 0.55)
 
     stdProperties = labelClass.get("standardLabelPlacementProperties", {})
     stdPlacementType = stdProperties.get("featureType")
