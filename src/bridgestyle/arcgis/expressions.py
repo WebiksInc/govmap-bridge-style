@@ -7,6 +7,8 @@ from .constants import PROPERTY_NAME_PATTERN
 def convertExpression(expression, engine, tolowercase, numericFields=None):
     if engine == "Arcade":
         expression = convertArcadeExpression(expression)
+    elif engine == "VBScript":
+        expression = convertVBScriptExpression(expression)
     if tolowercase:
         expression = expression.lower()
     if "+" in expression or "&" in expression:
@@ -60,6 +62,78 @@ def processPropertyName(token):
 
 def convertArcadeExpression(expression):
     return expression.replace("$feature.", "")
+
+
+# Matches a whole `Function <name> ( ... ) ... End Function` block (case-insensitive,
+# spanning multiple lines).
+_VB_FUNCTION_BLOCK = re.compile(
+    r"Function\s+(?P<name>\w+)\s*\(.*?\).*?End\s+Function",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# VBScript line continuation: an underscore at the end of a line.
+_VB_LINE_CONTINUATION = re.compile(r"_[ \t]*[\r\n]+")
+
+# VBScript type-cast/wrapper functions whose only effect here is coercion, e.g.
+# CStr([FOO]) -> [FOO]. The opening paren is matched; its partner is found by
+# scanning for balanced parentheses so nested casts are handled too.
+_VB_CAST = re.compile(
+    r"\bC(?:Str|Int|Lng|Dbl|Sng|Cur|Bool|Byte|Date|Var)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def convertVBScriptExpression(expression):
+    """Normalise a VBScript label expression to the inline form the rest of this
+    module already understands. Handles both inline expressions (returned as-is)
+    and multi-line `Function ... End Function` blocks, from which the core return
+    expression is extracted. VBScript type-cast wrappers such as ``CStr(...)`` are
+    stripped in either case."""
+    expression = _extractVBFunctionExpression(expression)
+    expression = _stripVBCasts(expression)
+    return expression
+
+
+def _extractVBFunctionExpression(expression):
+    match = _VB_FUNCTION_BLOCK.search(expression)
+    if not match:
+        # Inline expression; nothing to unwrap.
+        return expression
+    name = match.group("name")
+    body = _VB_LINE_CONTINUATION.sub(" ", match.group(0))
+    # The return value is whatever is assigned to the function name, e.g.
+    # `FindLabel = [CITY] & ...`. The signature uses `(`, not `=`, so it is
+    # never matched here.
+    assignment = re.search(
+        rf"\b{re.escape(name)}\s*=\s*(.+)", body, re.IGNORECASE
+    )
+    if not assignment:
+        return expression
+    core = re.split(r"\bEnd\s+Function\b", assignment.group(1), flags=re.IGNORECASE)[0]
+    return core.strip()
+
+
+def _stripVBCasts(expression):
+    while True:
+        match = _VB_CAST.search(expression)
+        if not match:
+            return expression
+        openParen = match.end() - 1
+        depth = 0
+        closeParen = None
+        for i in range(openParen, len(expression)):
+            if expression[i] == "(":
+                depth += 1
+            elif expression[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    closeParen = i
+                    break
+        if closeParen is None:
+            # Unbalanced parentheses; leave the expression untouched.
+            return expression
+        inner = expression[openParen + 1:closeParen]
+        expression = expression[:match.start()] + inner + expression[closeParen + 1:]
 
 
 def isValidPropertyName(token):
