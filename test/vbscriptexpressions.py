@@ -68,6 +68,38 @@ class VBScriptExpressionTest(unittest.TestCase):
             ],
         )
 
+    def test_backslashes_in_a_literal_are_kept(self):
+        # VBScript has no escape character, so "\n" here is a backslash and an "n",
+        # not a line break (unlike Arcade/Python).
+        self.assertEqual(
+            convertExpression('[A] & "C:\\temp\\new" & [B]', "VBScript", False),
+            [
+                "Concatenate",
+                ["PropertyName", "A"],
+                ["Concatenate", "C:\\temp\\new", ["PropertyName", "B"]],
+            ],
+        )
+
+    def test_doubled_quotes_in_a_literal_are_unescaped(self):
+        self.assertEqual(
+            convertExpression('[A] & "say ""hi""" & [B]', "VBScript", False),
+            [
+                "Concatenate",
+                ["PropertyName", "A"],
+                ["Concatenate", 'say "hi"', ["PropertyName", "B"]],
+            ],
+        )
+
+    def test_inner_whitespace_of_a_literal_is_significant(self):
+        self.assertEqual(
+            convertExpression('[A] & "  -  " & [B]', "VBScript", False),
+            [
+                "Concatenate",
+                ["PropertyName", "A"],
+                ["Concatenate", "  -  ", ["PropertyName", "B"]],
+            ],
+        )
+
     def test_single_field_function(self):
         expr = 'Function FindLabel([NAME])\n  FindLabel = [NAME]\nEnd Function'
         self.assertEqual(convertExpression(expr, "VBScript", True), ["PropertyName", "name"])

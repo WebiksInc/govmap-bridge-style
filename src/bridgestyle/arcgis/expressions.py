@@ -5,6 +5,9 @@ from .constants import PROPERTY_NAME_PATTERN
 
 
 def convertExpression(expression, engine, tolowercase, numericFields=None):
+    # Arcade and Python read "\n" inside a string literal as a line break; VBScript
+    # has no escape character, so there a backslash is just a backslash.
+    escapesNewLines = engine in ("Arcade", "Python")
     if engine == "Arcade":
         expression = convertArcadeExpression(expression)
     elif engine == "VBScript":
@@ -18,7 +21,7 @@ def convertExpression(expression, engine, tolowercase, numericFields=None):
             if "[" in token:
                 addends.append(propertyExpression(token, numericFields))
             else:
-                literal = replaceSpecialLiteral(token.strip().replace('"', ""))
+                literal = replaceSpecialLiteral(unquoteLiteral(token), escapesNewLines)
                 if not literal:
                     continue
                 # Merge consecutive literals (e.g. a newline followed by text) into a
@@ -39,9 +42,36 @@ def convertExpression(expression, engine, tolowercase, numericFields=None):
     return expression
 
 
-def replaceSpecialLiteral(literal):
-    if literal.lower() in ("vbnewline", "vbcrlf", "vblf"):
+# A string literal, as quoted by VBScript/Python (") or Arcade ('). The quotes
+# delimit the literal, so any whitespace inside them is significant.
+_QUOTED_LITERAL = re.compile(r"^(['\"])(?P<content>.*)\1$", re.DOTALL)
+
+# Escaped newlines inside an Arcade/Python string literal, e.g. 'Text:\n'.
+_ESCAPED_NEW_LINE = re.compile(r"\\r\\n|\\n|\\r")
+
+# Constants standing for a line break: VBScript's vbNewLine family and Arcade's
+# TextFormatting.NewLine.
+_NEW_LINE_CONSTANTS = ("vbnewline", "vbcrlf", "vblf", "textformatting.newline")
+
+
+def unquoteLiteral(token):
+    token = token.strip()
+    match = _QUOTED_LITERAL.match(token)
+    if match:
+        content = match.group("content")
+        if match.group(1) == '"':
+            # VBScript/Python escape a double quote by doubling it.
+            content = content.replace('""', '"')
+        return content
+    # Unbalanced or partial quoting: fall back to dropping the quote characters.
+    return token.replace('"', "")
+
+
+def replaceSpecialLiteral(literal, escapesNewLines=False):
+    if literal.lower() in _NEW_LINE_CONSTANTS:
         return WellKnownText.NEW_LINE
+    if escapesNewLines:
+        return _ESCAPED_NEW_LINE.sub(WellKnownText.NEW_LINE.value, literal)
     return literal
 
 
@@ -60,8 +90,20 @@ def processPropertyName(token):
     return token.replace("[", "").replace("]", "").strip()
 
 
+# An Arcade field reference: either `$feature.NAME` or `$feature["NAME"]`.
+_ARCADE_FIELD = re.compile(
+    r"\$feature\s*(?:\.\s*(?P<dotted>\w+)|\[\s*(?P<quote>['\"])(?P<quoted>[^'\"]+)(?P=quote)\s*\])",
+    re.IGNORECASE,
+)
+
+
 def convertArcadeExpression(expression):
-    return expression.replace("$feature.", "")
+    """Normalise an Arcade expression to the inline `[FIELD]` form the rest of this
+    module already understands: without the brackets, field references are
+    indistinguishable from string literals when the expression is tokenized."""
+    return _ARCADE_FIELD.sub(
+        lambda m: "[%s]" % (m.group("dotted") or m.group("quoted")), expression
+    )
 
 
 # Matches a whole `Function <name> ( ... ) ... End Function` block (case-insensitive,
@@ -215,7 +257,7 @@ def convertWhereClause(clause, tolowercase):
 
 def processRotationExpression(expression, rotationType, tolowercase):
     if "$feature" in expression:
-        field = convertArcadeExpression(expression)
+        field = processPropertyName(convertArcadeExpression(expression))
     else:
         field = processPropertyName(expression)
     propertyNameExpression = ["PropertyName", field.lower() if tolowercase else field]
