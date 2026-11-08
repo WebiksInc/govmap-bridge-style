@@ -637,6 +637,128 @@ def _hatchMarkerForAngle(angle):
     ][quadrant]
 
 
+HATCH_TILE_MAX_PX = 256
+HATCH_MAX_PERIODS = 8
+HATCH_SUPERSAMPLE = 4
+
+
+def _bestPeriods(period):
+    """The whole number of periods, and its width in whole pixels, that rounds `period` the least."""
+    limit = max(1, min(HATCH_MAX_PERIODS, int(HATCH_TILE_MAX_PX // period)))
+    count = min(range(1, limit + 1), key=lambda n: abs(round(n * period) - n * period) / (n * period))
+    return count, max(1, round(count * period))
+
+
+def _hatchTileGeometry(rotation, separation, offsetX):
+    """
+    Size and line family of a seamless tile for a hatch the shape:// marks cannot draw, at the size
+    it is drawn, so GeoServer repeats it without scaling (scaling blurs thin lines and leaves a seam
+    wherever the scaled width is not a whole pixel).
+    Lines run at `rotation` degrees counterclockwise, `separation` px apart. They repeat every
+    separation/|sin| along x and separation/|cos| along y; the tile spans the whole number of those
+    periods that comes closest to whole pixels, and the lines are laid out from the rounded sides, so
+    the tile stays seamless and the angle and spacing move by a fraction of a degree and a pixel.
+    ArcGIS stores a hatch's offset as offsetX, the x component of the shift across the lines, so the
+    shift itself is offsetX/sin: every offset in the TAMA 70 lyrx comes out a round number that way
+    (1, 2 and 3 mm at 30°, whole points at 45° and 135°), and the ArcGIS server draws them so.
+    Returns (width, height, a, b, phase, periods): the lines are a*x + b*y = k + phase in tile
+    pixels, and `periods` is how many lines cross the tile along each axis together.
+    """
+    radians = math.radians(rotation)
+    sin, cos = math.sin(radians), math.cos(radians)
+    flat, upright = abs(sin) < 1e-9, abs(cos) < 1e-9
+    columns, tileWidth = _bestPeriods(separation if flat else separation / abs(sin))
+    rows, tileHeight = _bestPeriods(separation if upright else separation / abs(cos))
+    # Screen y points down, so a line turned counterclockwise has the normal (sin, cos).
+    a = 0 if flat else math.copysign(columns / tileWidth, sin)
+    b = 0 if upright else math.copysign(rows / tileHeight, cos)
+    shift = 0 if flat else offsetX / sin
+    phase = (shift * math.hypot(a, b)) % 1
+    return tileWidth, tileHeight, a, b, phase, (0 if flat else columns) + (0 if upright else rows)
+
+
+def _drawHatchTile(tileWidth, tileHeight, a, b, phase, periods, lineWidth, rgba):
+    from io import BytesIO
+    from PIL import Image, ImageDraw
+
+    ss = HATCH_SUPERSAMPLE
+    # Drawn on a 3x3 block and cut from its middle, so lines crossing a tile edge are not clipped.
+    canvas = Image.new("RGBA", (3 * tileWidth * ss, 3 * tileHeight * ss), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    span = 3 * max(tileWidth, tileHeight) * ss
+    norm = math.hypot(a, b)
+    nx, ny = a / norm, b / norm
+    spacing = 1 / norm
+    # Over the 3x3 block a*x + b*y spans at most 3 * periods either side of 0.
+    reach = 3 * max(1, periods) + 1
+    for k in range(-reach, reach + 1):
+        # The point of the line nearest the block's origin, then a long segment along the line.
+        distance = (k + phase) * spacing * ss
+        cx, cy = nx * distance, ny * distance
+        draw.line(
+            [(cx - ny * span, cy + nx * span), (cx + ny * span, cy - nx * span)],
+            fill=rgba,
+            width=max(1, round(lineWidth * ss)),
+        )
+    tile = canvas.crop((tileWidth * ss, tileHeight * ss, 2 * tileWidth * ss, 2 * tileHeight * ss))
+    tile = tile.resize((tileWidth, tileHeight), Image.LANCZOS)
+    output = BytesIO()
+    tile.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _hatchTileFill(layer, color, width, opacity):
+    """
+    A hatch at an angle other than a multiple of 45°, or shifted by offsetX, as an image tile.
+    The shape:// marks only come at four angles and cannot be shifted, so such a hatch would be
+    drawn at the nearest of those angles, and hatches stacked at different offsets to build one
+    banded pattern would all land on the same line. Returns None to keep the mark for every other
+    hatch, for a dashed hatch (the dash would need its own period along the tile) and when Pillow
+    is missing.
+    """
+    rotation = layer.get("rotation", 0) or 0
+    offset = layer.get("offsetX", 0) or 0
+    separation = pt_to_px(layer.get("separation", 0) or 0)
+    if (rotation % 45 == 0 and offset == 0) or separation <= 0 or width <= 0:
+        return None
+    if "dasharray" in _extractEffect(layer["lineSymbol"]["symbolLayers"][0]):
+        return None
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        _warnings.append("Pillow is not installed; a rotated or shifted CIMHatchFill is drawn as a mark.")
+        return None
+
+    tileWidth, tileHeight, a, b, phase, periods = _hatchTileGeometry(rotation, separation, pt_to_px(offset))
+    r, g, bl = _hexToRGB(color)
+    alpha = round(255 * (opacity if opacity is not None else 1))
+    image = _drawHatchTile(tileWidth, tileHeight, a, b, phase, periods, width, (r, g, bl, alpha))
+
+    path = os.path.join(tempfile.gettempdir(), "bridgestyle", str(uuid.uuid4()).replace("-", ""))
+    os.makedirs(path, exist_ok=True)
+    iconFile = os.path.join(path, f"hatch-{uuid.uuid4()}.png")
+    with open(iconFile, "wb") as f:
+        f.write(image)
+    _usedIcons.append(iconFile)
+
+    return {
+        "kind": "Fill",
+        "opacity": 1.0,
+        "graphicFill": [
+            {
+                "opacity": 1.0,
+                "rotate": 0.0,
+                "kind": "Icon",
+                "color": None,
+                "image": iconFile,
+                "size": tileHeight,
+                "Z": 0,
+            }
+        ],
+        "Z": 0,
+    }
+
+
 def _esriFontToStandardSymbols(charindex):
     mapping = {
         33: "circle",
@@ -833,6 +955,10 @@ def processSymbolLayer(layer, symboltype, options):
         rotation = layer.get("rotation", 0)
         symbolLayers = layer["lineSymbol"]["symbolLayers"]
         color, width, opacity = _extractStroke(symbolLayers)
+
+        hatchTile = _hatchTileFill(layer, color, width, opacity)
+        if hatchTile:
+            return hatchTile
 
         # Use symbol and not rotation because rotation crops the line.
         wellKnowName = _hatchMarkerForAngle(rotation)
