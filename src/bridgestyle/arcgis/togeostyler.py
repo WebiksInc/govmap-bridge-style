@@ -637,36 +637,47 @@ def _hatchMarkerForAngle(angle):
     ][quadrant]
 
 
-HATCH_TILE_MIN_PX = 64
+HATCH_TILE_MAX_PX = 256
+HATCH_MAX_PERIODS = 8
 HATCH_SUPERSAMPLE = 4
 
 
-def _hatchTileGeometry(rotation, separation, offset):
+def _bestPeriods(period):
+    """The whole number of periods, and its width in whole pixels, that rounds `period` the least."""
+    limit = max(1, min(HATCH_MAX_PERIODS, int(HATCH_TILE_MAX_PX // period)))
+    count = min(range(1, limit + 1), key=lambda n: abs(round(n * period) - n * period) / (n * period))
+    return count, max(1, round(count * period))
+
+
+def _hatchTileGeometry(rotation, separation, offsetX):
     """
-    Size and line family of a seamless tile for a hatch the shape:// marks cannot draw.
-    Lines run at `rotation` degrees counterclockwise, `separation` px apart, shifted by `offset` px
-    across their direction. They repeat every separation/|sin| along x and separation/|cos| along y,
-    so a tile of those sides holds a whole number of lines at any angle. The tile is scaled up to
-    at least HATCH_TILE_MIN_PX and rounded to whole pixels; the lines are then laid out from the
-    rounded sides, so the tile stays seamless and the angle moves by well under a degree.
-    Returns (width, height, a, b, phase, scale): the lines are a*x + b*y = k + phase in tile pixels,
-    and `scale` is tile pixels per drawn pixel.
+    Size and line family of a seamless tile for a hatch the shape:// marks cannot draw, at the size
+    it is drawn, so GeoServer repeats it without scaling (scaling blurs thin lines and leaves a seam
+    wherever the scaled width is not a whole pixel).
+    Lines run at `rotation` degrees counterclockwise, `separation` px apart. They repeat every
+    separation/|sin| along x and separation/|cos| along y; the tile spans the whole number of those
+    periods that comes closest to whole pixels, and the lines are laid out from the rounded sides, so
+    the tile stays seamless and the angle and spacing move by a fraction of a degree and a pixel.
+    ArcGIS stores a hatch's offset as offsetX, the x component of the shift across the lines, so the
+    shift itself is offsetX/sin: every offset in the TAMA 70 lyrx comes out a round number that way
+    (1, 2 and 3 mm at 30°, whole points at 45° and 135°), and the ArcGIS server draws them so.
+    Returns (width, height, a, b, phase, periods): the lines are a*x + b*y = k + phase in tile
+    pixels, and `periods` is how many lines cross the tile along each axis together.
     """
     radians = math.radians(rotation)
     sin, cos = math.sin(radians), math.cos(radians)
     flat, upright = abs(sin) < 1e-9, abs(cos) < 1e-9
-    width = separation if flat else separation / abs(sin)
-    height = separation if upright else separation / abs(cos)
-    scale = max(1, math.ceil(HATCH_TILE_MIN_PX / min(width, height)))
-    tileWidth, tileHeight = max(1, round(width * scale)), max(1, round(height * scale))
+    columns, tileWidth = _bestPeriods(separation if flat else separation / abs(sin))
+    rows, tileHeight = _bestPeriods(separation if upright else separation / abs(cos))
     # Screen y points down, so a line turned counterclockwise has the normal (sin, cos).
-    a = 0 if flat else math.copysign(1 / tileWidth, sin)
-    b = 0 if upright else math.copysign(1 / tileHeight, cos)
-    phase = (offset * scale * math.hypot(a, b)) % 1
-    return tileWidth, tileHeight, a, b, phase, scale
+    a = 0 if flat else math.copysign(columns / tileWidth, sin)
+    b = 0 if upright else math.copysign(rows / tileHeight, cos)
+    shift = 0 if flat else offsetX / sin
+    phase = (shift * math.hypot(a, b)) % 1
+    return tileWidth, tileHeight, a, b, phase, (0 if flat else columns) + (0 if upright else rows)
 
 
-def _drawHatchTile(tileWidth, tileHeight, a, b, phase, lineWidth, rgba):
+def _drawHatchTile(tileWidth, tileHeight, a, b, phase, periods, lineWidth, rgba):
     from io import BytesIO
     from PIL import Image, ImageDraw
 
@@ -678,8 +689,9 @@ def _drawHatchTile(tileWidth, tileHeight, a, b, phase, lineWidth, rgba):
     norm = math.hypot(a, b)
     nx, ny = a / norm, b / norm
     spacing = 1 / norm
-    # a*x + b*y spans at most [-3, 6] over the 3x3 block, since |a|*width and |b|*height are 1.
-    for k in range(-4, 8):
+    # Over the 3x3 block a*x + b*y spans at most 3 * periods either side of 0.
+    reach = 3 * max(1, periods) + 1
+    for k in range(-reach, reach + 1):
         # The point of the line nearest the block's origin, then a long segment along the line.
         distance = (k + phase) * spacing * ss
         cx, cy = nx * distance, ny * distance
@@ -717,10 +729,10 @@ def _hatchTileFill(layer, color, width, opacity):
         _warnings.append("Pillow is not installed; a rotated or shifted CIMHatchFill is drawn as a mark.")
         return None
 
-    tileWidth, tileHeight, a, b, phase, scale = _hatchTileGeometry(rotation, separation, pt_to_px(offset))
+    tileWidth, tileHeight, a, b, phase, periods = _hatchTileGeometry(rotation, separation, pt_to_px(offset))
     r, g, bl = _hexToRGB(color)
     alpha = round(255 * (opacity if opacity is not None else 1))
-    image = _drawHatchTile(tileWidth, tileHeight, a, b, phase, width * scale, (r, g, bl, alpha))
+    image = _drawHatchTile(tileWidth, tileHeight, a, b, phase, periods, width, (r, g, bl, alpha))
 
     path = os.path.join(tempfile.gettempdir(), "bridgestyle", str(uuid.uuid4()).replace("-", ""))
     os.makedirs(path, exist_ok=True)
@@ -739,7 +751,7 @@ def _hatchTileFill(layer, color, width, opacity):
                 "kind": "Icon",
                 "color": None,
                 "image": iconFile,
-                "size": tileHeight / scale,
+                "size": tileHeight,
                 "Z": 0,
             }
         ],

@@ -33,18 +33,18 @@ class HatchTileTest(unittest.TestCase):
 
     def test_tile_keeps_the_angle_and_spacing(self):
         for rotation in (30, 5, 95, 330, 355):
-            width, height, a, b, _, scale = _hatchTileGeometry(rotation, 30.0, 0)
+            width, height, a, b, _, _ = _hatchTileGeometry(rotation, 30.0, 0)
             # The normal (a, b) of the drawn lines, back to a counterclockwise line angle.
             angle = math.degrees(math.atan2(a, b)) % 180
             self.assertAlmostEqual(angle, rotation % 180, delta=0.5, msg=rotation)
-            self.assertAlmostEqual(1 / math.hypot(a, b) / scale, 30.0, delta=0.3, msg=rotation)
-            self.assertGreaterEqual(min(width, height), 64)
+            # Drawn at its own size: the spacing in tile pixels is the spacing on the map.
+            self.assertAlmostEqual(1 / math.hypot(a, b), 30.0, delta=0.3, msg=rotation)
 
     def test_tile_is_seamless(self):
         from PIL import Image
 
-        width, height, a, b, phase, scale = _hatchTileGeometry(30, 30.0, 0)
-        tile = Image.open(BytesIO(_drawHatchTile(width, height, a, b, phase, 2 * scale, (0, 0, 0, 255))))
+        width, height, a, b, phase, periods = _hatchTileGeometry(30, 30.0, 0)
+        tile = Image.open(BytesIO(_drawHatchTile(width, height, a, b, phase, periods, 2, (0, 0, 0, 255))))
         alpha = tile.getchannel("A")
         # Tiled side by side, the last column and the first are neighbours, so a line leaving through
         # the right edge must continue at the left one.
@@ -52,9 +52,13 @@ class HatchTileTest(unittest.TestCase):
         left = [alpha.getpixel((0, y)) for y in range(height)]
         self.assertLess(sum(abs(r - l) for r, l in zip(right, left)) / height, 40)
 
-    def test_offset_moves_the_line(self):
-        width, height, a, b, phase, scale = _hatchTileGeometry(30, 30.0, 10.0)
+    def test_offset_is_the_x_component_of_the_shift(self):
+        # offsetX 5 at 30° shifts the lines by 5 / sin(30°) = 10 across a 30 px spacing.
+        _, _, _, _, phase, _ = _hatchTileGeometry(30, 30.0, 5.0)
         self.assertAlmostEqual(phase, 10.0 / 30.0, delta=0.02)
+        # At 45° the TAMA 70 offsets 2.8284 and 4.2426 come out 4 and 6.
+        _, _, _, _, phase, _ = _hatchTileGeometry(135, 30.0, 4.2426)
+        self.assertAlmostEqual(phase, 6.0 / 30.0, delta=0.02)
 
     def test_odd_angle_or_offset_becomes_an_image(self):
         fill = _fill(_hatch(30))
